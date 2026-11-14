@@ -405,16 +405,20 @@ export class LightmapPreview {
       near: 0.1,
       far: 40
     });
+    // The generated scenes can place a wall or arch close to a light. Soften
+    // the inverse-square falloff within half a world unit to avoid fireflies
+    // when a bounce lands near the light. Use the same falloff in live and baked lighting.
+    const attenuation: [number, number, number] = this.atlas ? [0.25, 0, 1] : [0, 0, 1];
     const primary: BakeLight = {
       type: 'point',
       position: [-1.5, 2.4, -0.6],
-      attenuation: [0, 0, 1],
+      attenuation,
       color: [5 * this.lightIntensity, 2 * this.lightIntensity, 0.5 * this.lightIntensity]
     };
     const secondary: BakeLight = {
       type: 'point',
       position: [1.5, 2.4, -0.6],
-      attenuation: [0, 0, 1],
+      attenuation,
       color: [0.5, 2, 5]
     };
     const recordShadows = (lights: BakeLight[]) =>
