@@ -64,6 +64,44 @@ it('WebGPURenderPass uses the view format and omits read-only stencil operations
   expect(attachment.stencilClearValue).toBeUndefined();
 });
 
+it('WebGPURenderPass reuses descriptors only while handles and device generation match', () => {
+  const profiler = {
+    enabled: true,
+    renderPassDescriptorCacheHits: 0,
+    renderPassDescriptorCacheMisses: 0
+  };
+  const device = {
+    _renderPassDescriptorGeneration: 0,
+    userData: {'cpu-hotspot-profiler': profiler}
+  };
+  const renderPass = makeRenderPass({clearColor: [0, 0, 0, 1]});
+  Object.assign(renderPass, {device});
+  const framebuffer = makeFramebuffer();
+  framebuffer.colorAttachments = [{handle: {}, destroyed: false, texture: {destroyed: false}}];
+  framebuffer.depthStencilAttachment = null;
+  framebuffer._renderPassDescriptorCache = new Map();
+
+  const firstDescriptor = renderPass.getRenderPassDescriptor(framebuffer);
+  const repeatedDescriptor = renderPass.getRenderPassDescriptor(framebuffer);
+  expect(repeatedDescriptor, 'identical live attachments reuse the cached descriptor').toBe(
+    firstDescriptor
+  );
+  expect(profiler.renderPassDescriptorCacheHits).toBe(1);
+  expect(profiler.renderPassDescriptorCacheMisses).toBe(1);
+
+  device._renderPassDescriptorGeneration++;
+  expect(
+    renderPass.getRenderPassDescriptor(framebuffer),
+    'device generation changes invalidate cached descriptors'
+  ).not.toBe(firstDescriptor);
+
+  framebuffer.colorAttachments[0].handle = {};
+  expect(
+    renderPass.getRenderPassDescriptor(framebuffer),
+    'attachment handle changes invalidate cached descriptors'
+  ).not.toBe(firstDescriptor);
+});
+
 it('WebGPU render passes and bundles preserve zero draw counts', () => {
   for (const Encoder of [WebGPURenderPass, WebGPURenderBundleEncoder]) {
     const calls: unknown[][] = [];

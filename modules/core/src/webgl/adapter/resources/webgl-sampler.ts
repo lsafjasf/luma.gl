@@ -7,6 +7,11 @@ import {GL, GLSamplerParameters} from '../../../webgl-constants/index';
 import {convertSamplerParametersToWebGL} from '../converters/sampler-parameters';
 import type {WebGLDevice} from '../webgl-device';
 
+export type WebGLSamplerProps = SamplerProps & {
+  /** @internal Cache key retained by the native handle cache. */
+  _samplerCacheKey?: string;
+};
+
 /**
  * Sampler object -
  * so that they can be set directly on the texture
@@ -16,16 +21,19 @@ export class WEBGLSampler extends Sampler {
   readonly device: WebGLDevice;
   readonly handle: WebGLSampler;
   readonly parameters: GLSamplerParameters;
+  private readonly _samplerCacheKey?: string;
 
-  constructor(device: WebGLDevice, props: SamplerProps) {
+  constructor(device: WebGLDevice, props: WebGLSamplerProps) {
     super(device, props);
     this.device = device;
+    this._samplerCacheKey = props._samplerCacheKey;
     this.parameters = convertSamplerParametersToWebGL(props);
     this.handle = props.handle || this.device.gl.createSampler();
     this._setSamplerParameters(this.parameters);
   }
 
   protected override destroyHandle(): void {
+    this.device._releaseCachedSampler(this._samplerCacheKey);
     if (this.handle && this.ownsHandle) {
       this.device.gl.deleteSampler(this.handle);
     }

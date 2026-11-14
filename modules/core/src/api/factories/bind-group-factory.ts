@@ -11,26 +11,44 @@ import type {
 import type {Device} from '../adapter/device';
 import type {ComputePipeline} from '../adapter/resources/compute-pipeline';
 import type {RenderPipeline} from '../adapter/resources/render-pipeline';
+import {Buffer} from '../adapter/resources/buffer';
+import {ExternalTexture} from '../adapter/resources/external-texture';
+import {Sampler} from '../adapter/resources/sampler';
+import {Texture} from '../adapter/resources/texture';
+import {TextureView} from '../adapter/resources/texture-view';
 import {normalizeBindingsByGroup} from '../adapter-utils/bind-groups';
+import {incrementFactoryCounter} from '../utils/factory-profiler';
 
 type AnyPipeline = RenderPipeline | ComputePipeline;
 type AnyShaderLayout = ShaderLayout | ComputeShaderLayout;
 type BindGroupCacheKeys = Partial<Record<number, object>>;
 type BindGroupMap = Partial<Record<number, unknown>>;
 type LayoutCache = Partial<Record<number, object>>;
+type LayoutBindGroupCacheEntry = {
+  bindGroup: unknown | null;
+  bindings: Bindings;
+  generations: number[];
+};
 type LayoutBindGroupCache = {
-  bindGroupsBySource: WeakMap<object, unknown | null>;
+  bindGroupsBySource: WeakMap<object, LayoutBindGroupCacheEntry>;
   emptyBindGroup?: unknown;
 };
 
 export class BindGroupFactory {
   readonly device: Device;
 
-  private readonly _layoutCacheByPipeline: WeakMap<AnyPipeline, LayoutCache> = new WeakMap();
-  private readonly _bindGroupCacheByLayout: WeakMap<object, LayoutBindGroupCache> = new WeakMap();
+  private _layoutCacheByPipeline: WeakMap<AnyPipeline, LayoutCache> = new WeakMap();
+  private _bindGroupCacheByLayout: WeakMap<object, LayoutBindGroupCache> = new WeakMap();
 
   constructor(device: Device) {
     this.device = device;
+  }
+
+  /** Drops all bind-group and layout caches after device loss or resource invalidation. */
+  invalidate(): void {
+    this._layoutCacheByPipeline = new WeakMap();
+    this._bindGroupCacheByLayout = new WeakMap();
+    incrementFactoryCounter(this.device, 'bindGroupCacheInvalidations');
   }
 
   getBindGroups(
@@ -65,9 +83,15 @@ export class BindGroupFactory {
       const bindGroupCacheKey = bindGroupCacheKeys?.[group];
       if (bindGroupCacheKey) {
         const layoutCache = this._getLayoutBindGroupCache(bindGroupLayout);
-        if (layoutCache.bindGroupsBySource.has(bindGroupCacheKey)) {
-          resolvedBindGroups[group] = layoutCache.bindGroupsBySource.get(bindGroupCacheKey) || null;
+        const cachedEntry = layoutCache.bindGroupsBySource.get(bindGroupCacheKey);
+        if (cachedEntry && this._isBindGroupCacheEntryUsable(cachedEntry, groupBindings)) {
+          cachedEntry.bindGroup = cachedEntry.bindGroup || null;
+          resolvedBindGroups[group] = cachedEntry.bindGroup;
+          incrementFactoryCounter(this.device, 'bindGroupCacheHits');
           continue;
+        }
+        if (cachedEntry) {
+          incrementFactoryCounter(this.device, 'bindGroupCacheInvalidations');
         }
 
         const bindGroup = this.device._createBindGroupWebGPU(
@@ -77,7 +101,12 @@ export class BindGroupFactory {
           group,
           bindGroupLabel
         );
-        layoutCache.bindGroupsBySource.set(bindGroupCacheKey, bindGroup);
+        layoutCache.bindGroupsBySource.set(bindGroupCacheKey, {
+          bindGroup,
+          bindings: {...groupBindings},
+          generations: getBindingGenerations(groupBindings)
+        });
+        incrementFactoryCounter(this.device, 'bindGroupCacheMisses');
         resolvedBindGroups[group] = bindGroup;
       } else {
         resolvedBindGroups[group] = this.device._createBindGroupWebGPU(
@@ -114,6 +143,23 @@ export class BindGroupFactory {
     layoutCache.emptyBindGroup ||=
       this.device._createBindGroupWebGPU(bindGroupLayout, shaderLayout, {}, group, label) || null;
     return layoutCache.emptyBindGroup;
+  }
+
+  private _isBindGroupCacheEntryUsable(
+    cachedEntry: LayoutBindGroupCacheEntry,
+    bindings: Bindings
+  ): boolean {
+    if (!isBindingsSnapshotEqual(cachedEntry.bindings, bindings)) {
+      return false;
+    }
+    if (!areBindingsUsable(bindings)) {
+      return false;
+    }
+    const generations = getBindingGenerations(bindings);
+    return (
+      generations.length === cachedEntry.generations.length &&
+      generations.every((generation, index) => generation === cachedEntry.generations[index])
+    );
   }
 
   private _getLayoutBindGroupCache(bindGroupLayout: object): LayoutBindGroupCache {
@@ -154,4 +200,55 @@ function getBindGroupLabel(
     .map(binding => binding.name);
   const bindingSuffix = bindingNames.length > 0 ? bindingNames.join(',') : 'empty';
   return `${pipeline.id}/group${group}[${bindingSuffix}]`;
+}
+
+function isBindingsSnapshotEqual(left: Bindings, right: Bindings): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+  return leftKeys.every(key => key in right && left[key] === right[key]);
+}
+
+function areBindingsUsable(bindings: Bindings): boolean {
+  return Object.values(bindings).every(binding => isBindingUsable(binding));
+}
+
+function isBindingUsable(binding: Bindings[string]): boolean {
+  if (binding instanceof Texture) {
+    return !binding.destroyed && !binding.view.destroyed && !binding.sampler.destroyed;
+  }
+  if (binding instanceof TextureView) {
+    return !binding.destroyed && !binding.texture.destroyed;
+  }
+  if (binding instanceof ExternalTexture) {
+    return !binding.destroyed && !binding.sampler.destroyed;
+  }
+  if (binding instanceof Sampler || binding instanceof Buffer) {
+    return !binding.destroyed;
+  }
+  if (binding && typeof binding === 'object' && 'buffer' in binding) {
+    return !binding.buffer.destroyed;
+  }
+  return true;
+}
+
+function getBindingGenerations(bindings: Bindings): number[] {
+  return Object.values(bindings).map(binding => getBindingGeneration(binding));
+}
+
+function getBindingGeneration(binding: Bindings[string]): number {
+  if (binding && typeof binding === 'object') {
+    if ('generation' in binding && typeof binding.generation === 'number') {
+      return binding.generation;
+    }
+    if ('buffer' in binding && binding.buffer instanceof Object) {
+      const buffer = binding.buffer as {generation?: unknown};
+      if (typeof buffer.generation === 'number') {
+        return buffer.generation;
+      }
+    }
+  }
+  return 0;
 }

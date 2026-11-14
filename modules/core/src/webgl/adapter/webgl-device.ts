@@ -56,7 +56,8 @@ import {uid} from '../utils/uid';
 
 import {WEBGLBuffer} from './resources/webgl-buffer';
 import {WEBGLShader} from './resources/webgl-shader';
-import {WEBGLSampler} from './resources/webgl-sampler';
+import {WEBGLSampler, type WebGLSamplerProps} from './resources/webgl-sampler';
+import {SamplerCache} from '../../api/factories/sampler-cache';
 import {WEBGLTexture} from './resources/webgl-texture';
 import {WEBGLFramebuffer} from './resources/webgl-framebuffer';
 import {WEBGLRenderPipeline} from './resources/webgl-render-pipeline';
@@ -110,6 +111,11 @@ export class WebGLDevice extends Device {
   private _resolveContextLost?: (value: DeviceLostInfo) => void;
   private _lossWasRequested = false;
   private _isLost: boolean = false;
+  private readonly _samplerCache = new SamplerCache<WebGLSampler>(this, handle => {
+    if (handle && !this.gl.isContextLost()) {
+      this.gl.deleteSampler(handle);
+    }
+  });
 
   /** WebGL2 context. */
   readonly gl!: WebGL2RenderingContext;
@@ -195,13 +201,16 @@ export class WebGLDevice extends Device {
       createBrowserContext(
         this.canvasContext.canvas,
         {
-          onContextLost: (_event: Event) =>
+          onContextLost: (_event: Event) => {
+            this._invalidateResourceCaches('context lost');
+            this._samplerCache.invalidate();
             this._resolveContextLost?.({
               reason: this._lossWasRequested ? 'destroyed' : 'unknown',
               message: this._lossWasRequested
                 ? 'Application triggered context loss'
                 : 'Entered sleep mode, or too many apps or browser tabs are using the GPU.'
-            }),
+            });
+          },
           onContextRestored: (_event: Event) => {
             // biome-ignore lint/suspicious/noConsole: debug-only context restore notification.
             console.log('WebGL context restored');
@@ -299,6 +308,8 @@ export class WebGLDevice extends Device {
     // Therefore we must do nothing in destroy() if props._reuseDevices is true
     if (!this.props._reuseDevices && !this._reused) {
       this._isLost = true;
+      this._invalidateResourceCaches('device destroyed');
+      this._samplerCache.invalidate();
       this.commandEncoder?.destroy();
       // Delete the reference to the device that we store on the WebGL context
       const contextData = getWebGLContextData(this.handle);
@@ -337,7 +348,28 @@ export class WebGLDevice extends Device {
 
   createSampler(props: SamplerProps): WEBGLSampler {
     this._assertContext();
-    return new WEBGLSampler(this, props);
+    const webglSamplerProps = props as WebGLSamplerProps;
+    if (webglSamplerProps.handle || webglSamplerProps._isHandleBorrowed) {
+      return new WEBGLSampler(this, webglSamplerProps);
+    }
+    const {key, handle} = this._samplerCache.retain(webglSamplerProps, () => {
+      const samplerHandle = this.gl.createSampler();
+      if (!samplerHandle) {
+        throw new Error(`${this}: unable to create sampler`);
+      }
+      return samplerHandle;
+    });
+    return new WEBGLSampler(this, {
+      ...webglSamplerProps,
+      handle,
+      _isHandleBorrowed: true,
+      _samplerCacheKey: key
+    });
+  }
+
+  /** @internal Releases one wrapper reference from the native sampler cache. */
+  _releaseCachedSampler(cacheKey: string | undefined): void {
+    this._samplerCache.release(cacheKey);
   }
 
   createShader(props: ShaderProps): WEBGLShader {

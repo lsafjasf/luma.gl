@@ -9,14 +9,21 @@ import {DeviceResource} from '../adapter/resources/device-resource';
 import type {SharedRenderPipeline} from '../adapter/resources/shared-render-pipeline';
 import {log} from '../utils/log';
 import {uid} from '../utils/uid';
+import {incrementFactoryCounter} from '../utils/factory-profiler';
 import type {CoreModuleState} from './core-module-state';
 
 export type PipelineFactoryProps = RenderPipelineProps;
 
-type CacheItem<ResourceT extends DeviceResource<any>> = {resource: ResourceT; useCount: number};
+type CacheItem<ResourceT extends DeviceResource<any>> = {
+  resource: ResourceT;
+  useCount: number;
+  lastUsed: number;
+};
 type PendingCacheItem<ResourceT extends DeviceResource<any>> = {
   promise: Promise<ResourceT>;
   useCount: number;
+  lastUsed: number;
+  generation: number;
 };
 
 const asyncCompilationByDevice = new WeakMap<Device, Promise<unknown>[]>();
@@ -67,6 +74,9 @@ export class PipelineFactory {
   readonly device: Device;
 
   private _hashCounter: number = 0;
+  private _useCounter: number = 0;
+  private _cacheGeneration: number = 0;
+  private _capabilityHash: number | null = null;
   private readonly _hashes: Record<string, number> = {};
   private readonly _renderPipelineCache: Record<string, CacheItem<RenderPipeline>> = {};
   private readonly _computePipelineCache: Record<string, CacheItem<ComputePipeline>> = {};
@@ -86,6 +96,59 @@ export class PipelineFactory {
 
   constructor(device: Device) {
     this.device = device;
+    const moduleData = device.getModuleData<CoreModuleState>('@luma.gl/core');
+    moduleData.pipelineFactories ||= new Set();
+    moduleData.pipelineFactories.add(new WeakRef(this));
+  }
+
+  /** Monotonic cache generation, advanced when device capabilities or handles become invalid. */
+  get cacheGeneration(): number {
+    return this._cacheGeneration;
+  }
+
+  /** Current retained cache sizes for diagnostics and tests. */
+  get cacheSize(): {
+    renderPipelines: number;
+    computePipelines: number;
+    pendingRenderPipelines: number;
+    pendingComputePipelines: number;
+    sharedRenderPipelines: number;
+  } {
+    return {
+      renderPipelines: Object.keys(this._renderPipelineCache).length,
+      computePipelines: Object.keys(this._computePipelineCache).length,
+      pendingRenderPipelines: Object.keys(this._pendingRenderPipelineCache).length,
+      pendingComputePipelines: Object.keys(this._pendingComputePipelineCache).length,
+      sharedRenderPipelines: Object.keys(this._sharedRenderPipelineCache).length
+    };
+  }
+
+  /**
+   * Drops every cached pipeline, pending compilation, and shared WebGL program.
+   *
+   * Device loss, context restoration, and explicit cache budget changes must call this
+   * before creating resources again so invalid backend handles cannot be reused.
+   */
+  invalidate(reason: string = 'cache invalidated'): void {
+    this._cacheGeneration++;
+    this._invalidateCache(this._renderPipelineCache);
+    this._invalidateCache(this._computePipelineCache);
+    for (const key of Object.keys(this._pendingRenderPipelineCache)) {
+      delete this._pendingRenderPipelineCache[key];
+    }
+    for (const key of Object.keys(this._pendingComputePipelineCache)) {
+      delete this._pendingComputePipelineCache[key];
+    }
+    for (const sharedPipeline of Object.values(this._sharedRenderPipelineCache)) {
+      sharedPipeline.resource.destroy();
+    }
+    for (const key of Object.keys(this._sharedRenderPipelineCache)) {
+      delete this._sharedRenderPipelineCache[key];
+    }
+    incrementFactoryCounter(this.device, 'pipelineCacheInvalidations');
+    if (this.device.props.debugFactories) {
+      log.log(1, `${this}: invalidated caches (${reason})`)();
+    }
   }
 
   /**
@@ -111,33 +174,53 @@ export class PipelineFactory {
     const cache = this._renderPipelineCache;
     const hash = this._hashRenderPipeline(allProps);
 
-    let pipeline: RenderPipeline = cache[hash]?.resource;
-    if (!pipeline) {
-      const sharedRenderPipeline =
-        this.device.type === 'webgl' && this.device.props._sharePipelines
-          ? this.createSharedRenderPipeline(allProps)
-          : undefined;
-      pipeline = this.device.createRenderPipeline({
-        ...allProps,
-        id: allProps.id ? `${allProps.id}-cached` : uid('unnamed-cached'),
-        _sharedRenderPipeline: sharedRenderPipeline
-      });
+    let cacheItem: CacheItem<RenderPipeline> | undefined = cache[hash];
+    if (cacheItem && !this._isCacheItemUsable(cacheItem.resource)) {
+      this._removeCacheItem(cache, hash, true);
+      cacheItem = undefined;
+    }
+
+    let pipeline: RenderPipeline;
+    if (!cacheItem) {
+      let sharedRenderPipeline: SharedRenderPipeline | undefined;
+      try {
+        sharedRenderPipeline =
+          this.device.type === 'webgl' && this.device.props._sharePipelines
+            ? this.createSharedRenderPipeline(allProps)
+            : undefined;
+        pipeline = this.device.createRenderPipeline({
+          ...allProps,
+          id: allProps.id ? `${allProps.id}-cached` : uid('unnamed-cached'),
+          _sharedRenderPipeline: sharedRenderPipeline
+        });
+      } catch (error) {
+        if (sharedRenderPipeline) {
+          this._releaseSharedRenderPipelineResource(sharedRenderPipeline);
+        }
+        incrementFactoryCounter(this.device, 'pipelineCompilationErrors');
+        throw error;
+      }
       pipeline.hash = hash;
-      cache[hash] = {resource: pipeline, useCount: 1};
+      cacheItem = {resource: pipeline, useCount: 1, lastUsed: this._nextUse()};
+      cache[hash] = cacheItem;
+      incrementFactoryCounter(this.device, 'pipelineCacheMisses');
+      this._enforceCacheLimit(cache);
       if (this.device.props.debugFactories) {
-        log.log(3, `${this}: ${pipeline} created, count=${cache[hash].useCount}`)();
+        log.log(3, `${this}: ${pipeline} created, count=${cacheItem.useCount}`)();
       }
     } else {
-      cache[hash].useCount++;
+      cacheItem.useCount++;
+      cacheItem.lastUsed = this._nextUse();
+      incrementFactoryCounter(this.device, 'pipelineCacheHits');
       if (this.device.props.debugFactories) {
         log.log(
           3,
-          `${this}: ${cache[hash].resource} reused, count=${cache[hash].useCount}, (id=${props.id})`
+          `${this}: ${cacheItem.resource} reused, count=${cacheItem.useCount}, (id=${props.id})`
         )();
       }
     }
 
-    return pipeline;
+    return cacheItem.resource;
   }
 
   /**
@@ -156,17 +239,7 @@ export class PipelineFactory {
       this._renderPipelineCache,
       this._pendingRenderPipelineCache,
       hash,
-      () => {
-        const sharedRenderPipeline =
-          this.device.type === 'webgl' && this.device.props._sharePipelines
-            ? this.createSharedRenderPipeline(allProps)
-            : undefined;
-        return this.device.createRenderPipelineAsync({
-          ...allProps,
-          id: allProps.id ? `${allProps.id}-cached` : uid('unnamed-cached'),
-          _sharedRenderPipeline: sharedRenderPipeline
-        });
-      }
+      () => this._createRenderPipelineAsyncInternal(allProps)
     );
   }
 
@@ -181,28 +254,44 @@ export class PipelineFactory {
     const cache = this._computePipelineCache;
     const hash = this._hashComputePipeline(allProps);
 
-    let pipeline: ComputePipeline = cache[hash]?.resource;
-    if (!pipeline) {
-      pipeline = this.device.createComputePipeline({
-        ...allProps,
-        id: allProps.id ? `${allProps.id}-cached` : undefined
-      });
+    let cacheItem: CacheItem<ComputePipeline> | undefined = cache[hash];
+    if (cacheItem && !this._isCacheItemUsable(cacheItem.resource)) {
+      this._removeCacheItem(cache, hash, true);
+      cacheItem = undefined;
+    }
+
+    if (!cacheItem) {
+      let pipeline: ComputePipeline;
+      try {
+        pipeline = this.device.createComputePipeline({
+          ...allProps,
+          id: allProps.id ? `${allProps.id}-cached` : undefined
+        });
+      } catch (error) {
+        incrementFactoryCounter(this.device, 'pipelineCompilationErrors');
+        throw error;
+      }
       pipeline.hash = hash;
-      cache[hash] = {resource: pipeline, useCount: 1};
+      cacheItem = {resource: pipeline, useCount: 1, lastUsed: this._nextUse()};
+      cache[hash] = cacheItem;
+      incrementFactoryCounter(this.device, 'pipelineCacheMisses');
+      this._enforceCacheLimit(cache);
       if (this.device.props.debugFactories) {
-        log.log(3, `${this}: ${pipeline} created, count=${cache[hash].useCount}`)();
+        log.log(3, `${this}: ${pipeline} created, count=${cacheItem.useCount}`)();
       }
     } else {
-      cache[hash].useCount++;
+      cacheItem.useCount++;
+      cacheItem.lastUsed = this._nextUse();
+      incrementFactoryCounter(this.device, 'pipelineCacheHits');
       if (this.device.props.debugFactories) {
         log.log(
           3,
-          `${this}: ${cache[hash].resource} reused, count=${cache[hash].useCount}, (id=${props.id})`
+          `${this}: ${cacheItem.resource} reused, count=${cacheItem.useCount}, (id=${props.id})`
         )();
       }
     }
 
-    return pipeline;
+    return cacheItem.resource;
   }
 
   /**
@@ -236,19 +325,29 @@ export class PipelineFactory {
     }
 
     const cache = this._getCache(pipeline);
-    const hash = pipeline.hash;
+    const cacheItem = cache?.[pipeline.hash];
+    if (!cacheItem || cacheItem.resource !== pipeline) {
+      if (!pipeline.destroyed) {
+        pipeline.destroy();
+      }
+      return;
+    }
 
-    cache[hash].useCount--;
-    if (cache[hash].useCount === 0) {
+    cacheItem.useCount--;
+    cacheItem.lastUsed = this._nextUse();
+    if (cacheItem.useCount === 0) {
       this._destroyPipeline(pipeline);
+      this._enforceCacheLimitForPipeline(pipeline);
       if (this.device.props.debugFactories) {
         log.log(3, `${this}: ${pipeline} released and destroyed`)();
       }
-    } else if (cache[hash].useCount < 0) {
+    } else if (cacheItem.useCount < 0) {
       log.error(`${this}: ${pipeline} released, useCount < 0, resetting`)();
-      cache[hash].useCount = 0;
+      cacheItem.useCount = 0;
+      this._destroyPipeline(pipeline);
+      this._enforceCacheLimitForPipeline(pipeline);
     } else if (this.device.props.debugFactories) {
-      log.log(3, `${this}: ${pipeline} released, count=${cache[hash].useCount}`)();
+      log.log(3, `${this}: ${pipeline} released, count=${cacheItem.useCount}`)();
     }
   }
 
@@ -257,10 +356,11 @@ export class PipelineFactory {
     let sharedCacheItem = this._sharedRenderPipelineCache[sharedPipelineHash];
     if (!sharedCacheItem) {
       const sharedRenderPipeline = this.device._createSharedRenderPipelineWebGL(props);
-      sharedCacheItem = {resource: sharedRenderPipeline, useCount: 0};
+      sharedCacheItem = {resource: sharedRenderPipeline, useCount: 0, lastUsed: this._nextUse()};
       this._sharedRenderPipelineCache[sharedPipelineHash] = sharedCacheItem;
     }
     sharedCacheItem.useCount++;
+    sharedCacheItem.lastUsed = this._nextUse();
     return sharedCacheItem.resource;
   }
 
@@ -270,19 +370,131 @@ export class PipelineFactory {
     }
 
     const sharedPipelineHash = this._hashSharedRenderPipeline(pipeline.sharedRenderPipeline.props);
+    this._releaseSharedRenderPipelineAtKey(sharedPipelineHash);
+  }
+
+  // PRIVATE
+
+  private async _createRenderPipelineAsyncInternal(
+    props: Required<RenderPipelineProps>
+  ): Promise<RenderPipeline> {
+    let sharedRenderPipeline: SharedRenderPipeline | undefined;
+    try {
+      sharedRenderPipeline =
+        this.device.type === 'webgl' && this.device.props._sharePipelines
+          ? this.createSharedRenderPipeline(props)
+          : undefined;
+      return await this.device.createRenderPipelineAsync({
+        ...props,
+        id: props.id ? `${props.id}-cached` : uid('unnamed-cached'),
+        _sharedRenderPipeline: sharedRenderPipeline
+      });
+    } catch (error) {
+      if (sharedRenderPipeline) {
+        this._releaseSharedRenderPipelineResource(sharedRenderPipeline);
+      }
+      throw error;
+    }
+  }
+
+  private _nextUse(): number {
+    this._useCounter++;
+    return this._useCounter;
+  }
+
+  private _isCacheItemUsable(pipeline: RenderPipeline | ComputePipeline): boolean {
+    if (pipeline.destroyed) {
+      return false;
+    }
+    if (pipeline instanceof RenderPipeline && pipeline.isErrored) {
+      return false;
+    }
+    return true;
+  }
+
+  private _removeCacheItem<ResourceT extends RenderPipeline | ComputePipeline>(
+    cache: Record<string, CacheItem<ResourceT>>,
+    hash: string,
+    destroy: boolean,
+    counter: 'pipelineCacheEvictions' | 'pipelineCacheInvalidations' = 'pipelineCacheEvictions'
+  ): boolean {
+    const cacheItem = cache[hash];
+    if (!cacheItem) {
+      return false;
+    }
+    delete cache[hash];
+    if (destroy) {
+      cacheItem.resource.destroy();
+      if (cacheItem.resource instanceof RenderPipeline) {
+        this.releaseSharedRenderPipeline(cacheItem.resource);
+      }
+      incrementFactoryCounter(this.device, counter);
+    }
+    return true;
+  }
+
+  private _invalidateCache<ResourceT extends RenderPipeline | ComputePipeline>(
+    cache: Record<string, CacheItem<ResourceT>>
+  ): void {
+    for (const key of Object.keys(cache)) {
+      this._removeCacheItem(cache, key, true, 'pipelineCacheInvalidations');
+    }
+  }
+
+  private _releaseSharedRenderPipelineResource(sharedRenderPipeline: SharedRenderPipeline): void {
+    const sharedPipelineHash = this._hashSharedRenderPipeline(sharedRenderPipeline.props);
+    this._releaseSharedRenderPipelineAtKey(sharedPipelineHash);
+  }
+
+  private _releaseSharedRenderPipelineAtKey(sharedPipelineHash: string): void {
     const sharedCacheItem = this._sharedRenderPipelineCache[sharedPipelineHash];
     if (!sharedCacheItem) {
       return;
     }
 
     sharedCacheItem.useCount--;
+    sharedCacheItem.lastUsed = this._nextUse();
     if (sharedCacheItem.useCount === 0) {
       sharedCacheItem.resource.destroy();
       delete this._sharedRenderPipelineCache[sharedPipelineHash];
     }
   }
 
-  // PRIVATE
+  private _enforceCacheLimit<ResourceT extends RenderPipeline | ComputePipeline>(
+    cache: Record<string, CacheItem<ResourceT>>
+  ): void {
+    const cacheLimit = this._getPipelineCacheLimit();
+    if (cacheLimit === Number.POSITIVE_INFINITY) {
+      return;
+    }
+
+    while (Object.keys(cache).length > cacheLimit) {
+      const unusedEntry = Object.entries(cache)
+        .filter(([, cacheItem]) => cacheItem.useCount === 0)
+        .sort((left, right) => left[1].lastUsed - right[1].lastUsed)[0];
+      if (!unusedEntry) {
+        return;
+      }
+      this._removeCacheItem(cache, unusedEntry[0], true);
+    }
+  }
+
+  private _enforceCacheLimitForPipeline(pipeline: RenderPipeline | ComputePipeline): void {
+    if (pipeline instanceof ComputePipeline) {
+      this._enforceCacheLimit(this._computePipelineCache);
+    } else {
+      this._enforceCacheLimit(this._renderPipelineCache);
+    }
+  }
+
+  private _getPipelineCacheLimit(): number {
+    const cacheLimit =
+      this.device.props._pipelineCacheLimit ?? this.device.props._pipelineCacheBudget;
+    if (cacheLimit === undefined || cacheLimit === null || !Number.isFinite(cacheLimit)) {
+      return Number.POSITIVE_INFINITY;
+    }
+    return Math.max(0, Math.floor(cacheLimit));
+  }
 
   private async _createPipelineAsync<ResourceT extends RenderPipeline | ComputePipeline>(
     cache: Record<string, CacheItem<ResourceT>>,
@@ -290,36 +502,85 @@ export class PipelineFactory {
     hash: string,
     create: () => Promise<ResourceT>
   ): Promise<ResourceT> {
-    const cachedItem = cache[hash];
+    let cachedItem: CacheItem<ResourceT> | undefined = cache[hash];
+    if (cachedItem && !this._isCacheItemUsable(cachedItem.resource)) {
+      this._removeCacheItem(cache, hash, true);
+      cachedItem = undefined;
+    }
     if (cachedItem) {
       cachedItem.useCount++;
+      cachedItem.lastUsed = this._nextUse();
+      incrementFactoryCounter(this.device, 'pipelineCacheHits');
       return cachedItem.resource;
     }
-    const pendingItem = pendingCache[hash];
+    let pendingItem: PendingCacheItem<ResourceT> | undefined = pendingCache[hash];
+    if (pendingItem && pendingItem.generation !== this._cacheGeneration) {
+      delete pendingCache[hash];
+      pendingItem = undefined;
+    }
     if (pendingItem) {
       pendingItem.useCount++;
+      pendingItem.lastUsed = this._nextUse();
+      incrementFactoryCounter(this.device, 'pipelineCachePendingHits');
       return await pendingItem.promise;
     }
 
-    const item: PendingCacheItem<ResourceT> = {promise: undefined!, useCount: 1};
+    const item: PendingCacheItem<ResourceT> = {
+      promise: undefined!,
+      useCount: 1,
+      lastUsed: this._nextUse(),
+      generation: this._cacheGeneration
+    };
     item.promise = create()
       .then(pipeline => {
-        delete pendingCache[hash];
-        const synchronousItem = cache[hash];
-        if (synchronousItem) {
-          synchronousItem.useCount += item.useCount;
+        if (pendingCache[hash] === item) {
+          delete pendingCache[hash];
+        }
+        if (item.generation !== this._cacheGeneration) {
           pipeline.destroy();
           if (pipeline instanceof RenderPipeline) {
             this.releaseSharedRenderPipeline(pipeline);
           }
-          return synchronousItem.resource;
+          incrementFactoryCounter(this.device, 'pipelineCacheInvalidations');
+          throw new Error(`${this}: pipeline compilation was invalidated`);
+        }
+        if (!this._isCacheItemUsable(pipeline)) {
+          pipeline.destroy();
+          if (pipeline instanceof RenderPipeline) {
+            this.releaseSharedRenderPipeline(pipeline);
+          }
+          throw new Error(`${this}: compiled pipeline is not usable`);
+        }
+        const synchronousItem = cache[hash];
+        if (synchronousItem) {
+          if (this._isCacheItemUsable(synchronousItem.resource)) {
+            synchronousItem.useCount += item.useCount;
+            synchronousItem.lastUsed = this._nextUse();
+            pipeline.destroy();
+            if (pipeline instanceof RenderPipeline) {
+              this.releaseSharedRenderPipeline(pipeline);
+            }
+            return synchronousItem.resource;
+          }
+          this._removeCacheItem(cache, hash, true);
         }
         pipeline.hash = hash;
-        cache[hash] = {resource: pipeline, useCount: item.useCount};
+        cache[hash] = {
+          resource: pipeline,
+          useCount: item.useCount,
+          lastUsed: this._nextUse()
+        };
+        incrementFactoryCounter(this.device, 'pipelineCacheMisses');
+        this._enforceCacheLimit(cache);
         return pipeline;
       })
       .catch(error => {
-        delete pendingCache[hash];
+        if (pendingCache[hash] === item) {
+          delete pendingCache[hash];
+        }
+        if (item.generation === this._cacheGeneration) {
+          incrementFactoryCounter(this.device, 'pipelineCompilationErrors');
+        }
         throw error;
       });
     pendingCache[hash] = item;
@@ -328,24 +589,20 @@ export class PipelineFactory {
 
   /** Destroy a cached pipeline, removing it from the cache if configured to do so. */
   private _destroyPipeline(pipeline: RenderPipeline | ComputePipeline): boolean {
-    const cache = this._getCache(pipeline);
-
     if (!this.device.props._destroyPipelines) {
       return false;
     }
 
-    delete cache[pipeline.hash];
-    pipeline.destroy();
-    if (pipeline instanceof RenderPipeline) {
-      this.releaseSharedRenderPipeline(pipeline);
+    if (pipeline instanceof ComputePipeline) {
+      return this._removeCacheItem(this._computePipelineCache, pipeline.hash, true);
     }
-    return true;
+    return this._removeCacheItem(this._renderPipelineCache, pipeline.hash, true);
   }
 
   /** Get the appropriate cache for the type of pipeline */
   private _getCache(
     pipeline: RenderPipeline | ComputePipeline
-  ): Record<string, CacheItem<RenderPipeline>> | Record<string, CacheItem<ComputePipeline>> {
+  ): Record<string, CacheItem<RenderPipeline>> | Record<string, CacheItem<ComputePipeline>> | null {
     let cache:
       | Record<string, CacheItem<RenderPipeline>>
       | Record<string, CacheItem<ComputePipeline>>
@@ -357,10 +614,7 @@ export class PipelineFactory {
       cache = this._renderPipelineCache;
     }
     if (!cache) {
-      throw new Error(`${this}`);
-    }
-    if (!cache[pipeline.hash]) {
-      throw new Error(`${this}: ${pipeline} matched incorrect entry`);
+      return null;
     }
     return cache;
   }
@@ -369,10 +623,16 @@ export class PipelineFactory {
   private _hashComputePipeline(props: ComputePipelineProps): string {
     // This cache is device-local and separate from render pipeline caches.
     const shaderHash = this._getHash(props.shader.source);
+    const shaderSignatureHash = this._getHash(
+      JSON.stringify({
+        stage: props.shader.stage,
+        language: props.shader.props.language
+      })
+    );
     const configurationHash = this._getHash(
       JSON.stringify([props.shaderLayout, props.entryPoint ?? 'main', props.constants])
     );
-    return `${shaderHash}/${configurationHash}`;
+    return `G${this._cacheGeneration}/C${this._getCapabilityHash()}/S${shaderSignatureHash}/${shaderHash}/${configurationHash}`;
   }
 
   /** Calculate a hash based on all the inputs for a render pipeline */
@@ -388,13 +648,20 @@ export class PipelineFactory {
     // - `id`, `handle`: resource identity / caller-supplied handles, not cache shape
     // - `bindings`: mutable per-pipeline compatibility state
     // - `disableWarnings`: logging only, no rendering impact
-    // - `vsConstants`, `fsConstants`: currently unused by pipeline creation
-    const vsHash = props.vs ? this._getHash(props.vs.source) : 0;
-    const fsHash = props.fs ? this._getHash(props.fs.source) : 0;
+    const vsHash = props.vs
+      ? this._getHash(`${props.vs.stage}:${props.vs.props.language}:${props.vs.source}`)
+      : 0;
+    const fsHash = props.fs
+      ? this._getHash(`${props.fs.stage}:${props.fs.props.language}:${props.fs.source}`)
+      : 0;
     const varyingHash = this._getWebGLVaryingHash(props);
     const shaderLayoutHash = this._getHash(JSON.stringify(props.shaderLayout));
     const uniformBlockLayoutHash = this._getHash(JSON.stringify(props._uniformBlockLayouts));
     const bufferLayoutHash = this._getHash(JSON.stringify(props.bufferLayout));
+    const pipelineCapabilityHash = this._getCapabilityHash();
+    const constantsHash = this._getHash(
+      JSON.stringify({vsConstants: props.vsConstants, fsConstants: props.fsConstants})
+    );
 
     const {type} = this.device;
     switch (type) {
@@ -404,7 +671,7 @@ export class PipelineFactory {
         // Future WebGL-only additions here must not turn wrapper reuse into a prerequisite
         // for shared `WebGLProgram` reuse.
         const webglParameterHash = this._getHash(JSON.stringify(props.parameters));
-        return `${type}/R/${vsHash}/${fsHash}V${varyingHash}T${props.topology}P${webglParameterHash}SL${shaderLayoutHash}UBL${uniformBlockLayoutHash}BL${bufferLayoutHash}`;
+        return `G${this._cacheGeneration}/${type}/C${pipelineCapabilityHash}/R/${vsHash}/${fsHash}V${varyingHash}T${props.topology}P${webglParameterHash}K${constantsHash}SL${shaderLayoutHash}UBL${uniformBlockLayoutHash}BL${bufferLayoutHash}`;
 
       case 'webgpu':
       default:
@@ -422,7 +689,7 @@ export class PipelineFactory {
         const attachmentHash = this._getWebGPUAttachmentHash(props);
         // TODO - Can json.stringify() generate different strings for equivalent objects if order of params is different?
         // create a deepHash() to deduplicate?
-        return `${type}/R/${vsHash}/${fsHash}V${varyingHash}T${props.topology}EP${entryPointHash}P${parameterHash}SL${shaderLayoutHash}BL${bufferLayoutHash}A${attachmentHash}`;
+        return `G${this._cacheGeneration}/${type}/C${pipelineCapabilityHash}/R/${vsHash}/${fsHash}V${varyingHash}T${props.topology}EP${entryPointHash}P${parameterHash}K${constantsHash}SL${shaderLayoutHash}BL${bufferLayoutHash}A${attachmentHash}`;
     }
   }
 
@@ -434,7 +701,7 @@ export class PipelineFactory {
     const vsHash = props.vs ? this._getHash(props.vs.source) : 0;
     const fsHash = props.fs ? this._getHash(props.fs.source) : 0;
     const varyingHash = this._getWebGLVaryingHash(props);
-    return `webgl/S/${vsHash}/${fsHash}V${varyingHash}`;
+    return `G${this._cacheGeneration}/webgl/C${this._getCapabilityHash()}/S/${vsHash}/${fsHash}V${varyingHash}`;
   }
 
   private _getHash(key: string): number {
@@ -447,6 +714,43 @@ export class PipelineFactory {
   private _getWebGLVaryingHash(props: RenderPipelineProps): number {
     const {varyings = [], bufferMode = null} = props;
     return this._getHash(JSON.stringify({varyings, bufferMode}));
+  }
+
+  /**
+   * Capability fingerprint for one device generation.
+   *
+   * Factories are device-local, but including this in the key makes the separation explicit
+   * and prevents a recycled factory from aliasing a pipeline after a feature level or limit
+   * change (for example an attached-device upgrade).
+   */
+  private _getCapabilityHash(): number {
+    if (this._capabilityHash !== null) {
+      return this._capabilityHash;
+    }
+    const info = this.device.info;
+    const limits = this.device.limits;
+    const features = Array.from(this.device.features).sort();
+    this._capabilityHash = this._getHash(
+      JSON.stringify({
+        type: this.device.type,
+        featureLevel: info?.featureLevel ?? null,
+        shadingLanguage: info?.shadingLanguage ?? null,
+        shadingLanguageVersion: info?.shadingLanguageVersion ?? null,
+        preferredColorFormat: this.device.preferredColorFormat,
+        preferredDepthFormat: this.device.preferredDepthFormat,
+        features,
+        limits: {
+          maxBindGroups: limits?.maxBindGroups,
+          maxBindingsPerBindGroup: limits?.maxBindingsPerBindGroup,
+          maxColorAttachments: limits?.maxColorAttachments,
+          maxVertexAttributes: limits?.maxVertexAttributes,
+          maxSamplersPerShaderStage: limits?.maxSamplersPerShaderStage,
+          maxUniformBufferBindingSize: limits?.maxUniformBufferBindingSize,
+          maxStorageBufferBindingSize: limits?.maxStorageBufferBindingSize
+        }
+      })
+    );
+    return this._capabilityHash;
   }
 
   private _getWebGPUAttachmentHash(props: RenderPipelineProps): number {

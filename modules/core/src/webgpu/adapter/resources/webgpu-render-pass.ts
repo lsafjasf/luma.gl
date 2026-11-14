@@ -92,7 +92,9 @@ export class WebGPURenderPass extends RenderPass {
     const startTime = profiler ? getTimestamp() : 0;
     try {
       const descriptorAssemblyStartTime = profiler ? getTimestamp() : 0;
-      const renderPassDescriptor = this.getRenderPassDescriptor(this.framebuffer);
+      const renderPassDescriptor: GPURenderPassDescriptor = {
+        ...this.getRenderPassDescriptor(this.framebuffer)
+      };
 
       if (renderPassProps.occlusionQuerySet) {
         renderPassDescriptor.occlusionQuerySet = (
@@ -335,6 +337,29 @@ export class WebGPURenderPass extends RenderPass {
    * @returns attachments fields of a renderpass descriptor.
    */
   protected getRenderPassDescriptor(framebuffer: WebGPUFramebuffer): GPURenderPassDescriptor {
+    const profiler = this.device ? getCpuHotspotProfiler(this.device) : null;
+    const cacheKey = this._getRenderPassDescriptorCacheKey();
+    const attachmentHandles = getAttachmentHandles(this.props, framebuffer);
+    const descriptorCache = framebuffer._renderPassDescriptorCache;
+    const generation = this.device?._renderPassDescriptorGeneration;
+    const cachedEntry = descriptorCache?.get(cacheKey);
+    if (
+      cachedEntry &&
+      generation !== undefined &&
+      cachedEntry.generation === generation &&
+      areHandlesEqual(cachedEntry.handles, attachmentHandles) &&
+      areFramebufferAttachmentsUsable(this.props, framebuffer)
+    ) {
+      if (profiler) {
+        profiler.renderPassDescriptorCacheHits = (profiler.renderPassDescriptorCacheHits || 0) + 1;
+      }
+      return cachedEntry.descriptor;
+    }
+
+    if (profiler) {
+      profiler.renderPassDescriptorCacheMisses =
+        (profiler.renderPassDescriptorCacheMisses || 0) + 1;
+    }
     const renderPassDescriptor: GPURenderPassDescriptor = {
       colorAttachments: []
     };
@@ -394,10 +419,85 @@ export class WebGPURenderPass extends RenderPass {
       }
     }
 
+    if (
+      descriptorCache &&
+      generation !== undefined &&
+      !descriptorCache.has(cacheKey) &&
+      descriptorCache.size >= 8
+    ) {
+      const oldestKey = descriptorCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        descriptorCache.delete(oldestKey);
+        if (profiler) {
+          profiler.renderPassDescriptorCacheEvictions =
+            (profiler.renderPassDescriptorCacheEvictions || 0) + 1;
+        }
+      }
+    }
+    if (descriptorCache && generation !== undefined) {
+      descriptorCache.set(cacheKey, {
+        generation,
+        handles: attachmentHandles,
+        descriptor: renderPassDescriptor
+      });
+    }
     return renderPassDescriptor;
+  }
+
+  private _getRenderPassDescriptorCacheKey(): string {
+    const {
+      clearColor,
+      clearColors,
+      clearDepth,
+      clearStencil,
+      depthReadOnly,
+      stencilReadOnly,
+      discard
+    } = this.props;
+    return JSON.stringify({
+      clearColor: serializeClearValue(clearColor),
+      clearColors: clearColors?.map(serializeClearValue),
+      clearDepth,
+      clearStencil,
+      depthReadOnly,
+      stencilReadOnly,
+      discard
+    });
   }
 }
 
 function convertColor(color: TypedArray | NumberArray4): GPUColor {
   return {r: color[0], g: color[1], b: color[2], a: color[3]};
+}
+
+function serializeClearValue(
+  value: TypedArray | NumberArray4 | false | undefined
+): number[] | false | undefined {
+  return value === false || value === undefined ? value : Array.from(value);
+}
+
+function getAttachmentHandles(props: RenderPassProps, framebuffer: WebGPUFramebuffer): unknown[] {
+  return [
+    ...framebuffer.colorAttachments.map(attachment => attachment.handle),
+    framebuffer.depthStencilAttachment?.handle ?? null,
+    ...(props.resolveTargets || []).map(resolveTarget => resolveTarget?.handle ?? null)
+  ];
+}
+
+function areHandlesEqual(left: unknown[], right: unknown[]): boolean {
+  return left.length === right.length && left.every((handle, index) => handle === right[index]);
+}
+
+function areFramebufferAttachmentsUsable(
+  props: RenderPassProps,
+  framebuffer: WebGPUFramebuffer
+): boolean {
+  const attachments: (WebGPUTextureView | null)[] = [
+    ...framebuffer.colorAttachments,
+    framebuffer.depthStencilAttachment,
+    ...((props.resolveTargets || []) as (WebGPUTextureView | null)[])
+  ];
+  return attachments.every(
+    attachment => !attachment || (!attachment.destroyed && !attachment.texture.destroyed)
+  );
 }

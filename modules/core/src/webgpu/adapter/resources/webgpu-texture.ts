@@ -44,7 +44,7 @@ export class WebGPUTexture extends Texture {
     } else if (props.sampler === undefined) {
       this.sampler = this.device.getDefaultSampler();
     } else {
-      this.sampler = new WebGPUSampler(this.device, (props.sampler as WebGPUSamplerProps) || {});
+      this.sampler = this.device.createSampler((props.sampler as WebGPUSamplerProps) || {});
       this.attachResource(this.sampler);
     }
 

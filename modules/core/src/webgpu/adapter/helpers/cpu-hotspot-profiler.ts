@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright (c) vis.gl contributors
 
+import type {FactoryProfilerCounters} from '../../../api/utils/factory-profiler';
+
 /**
  * Internal WebGPU CPU hotspot profiler helpers.
  *
@@ -11,7 +13,7 @@
 export const CPU_HOTSPOT_PROFILER_MODULE = 'cpu-hotspot-profiler';
 export const CPU_HOTSPOT_SUBMIT_REASON = 'cpu-hotspot-submit-reason';
 
-export type CpuHotspotProfiler = {
+export type CpuHotspotProfiler = FactoryProfilerCounters & {
   enabled?: boolean;
   framebufferAcquireCount?: number;
   framebufferAcquireTimeMs?: number;
@@ -24,6 +26,9 @@ export type CpuHotspotProfiler = {
   renderPassSetupTimeMs?: number;
   renderPassDescriptorAssemblyCount?: number;
   renderPassDescriptorAssemblyTimeMs?: number;
+  renderPassDescriptorCacheHits?: number;
+  renderPassDescriptorCacheMisses?: number;
+  renderPassDescriptorCacheEvictions?: number;
   renderPassBeginCount?: number;
   renderPassBeginTimeMs?: number;
   submitCount?: number;

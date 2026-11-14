@@ -48,8 +48,11 @@ export const DEVICE_DEFAULT_PROPS: Required<DeviceProps> = {
   _cacheShaders: true,
   _destroyShaders: false,
   _cachePipelines: true,
+  _pipelineCacheLimit: undefined!,
+  _pipelineCacheBudget: undefined!,
   _sharePipelines: true,
   _destroyPipelines: false,
+  _samplerCacheLimit: undefined!,
   // TODO - Change these after confirming things work as expected
   _initializeFeatures: true,
   _disabledFeatures: {

@@ -7,5 +7,7 @@ import type {ShaderFactory} from './shader-factory';
 
 export type CoreModuleState = {
   defaultPipelineFactory?: PipelineFactory;
+  pipelineFactories?: Set<WeakRef<PipelineFactory>>;
   defaultShaderFactory?: ShaderFactory;
+  shaderFactories?: Set<WeakRef<ShaderFactory>>;
 };

@@ -75,6 +75,19 @@ pipeline.
 
 Releases a previously requested pipeline. When the reference count reaches zero, the pipeline is either destroyed or retained depending on `device.props._destroyPipelines`.
 
+### `invalidate(reason?: string): void`
+
+Destroys cached pipelines and pending cache entries, and advances `cacheGeneration`. Device loss and
+WebGL context loss call this automatically for every factory associated with the device.
+
+### `cacheGeneration: number`
+
+Monotonic generation used to reject pending compilations that finish after a cache invalidation.
+
+### `cacheSize`
+
+Returns retained render, compute, pending, and shared-pipeline entry counts for diagnostics.
+
 ## WebGL Notes
 
 - On WebGL, `PipelineFactory` may return different cached `RenderPipeline` wrappers that share one linked `WebGLProgram`.
@@ -92,6 +105,12 @@ Releases a previously requested pipeline. When the reference count reaches zero,
 By default, `PipelineFactory` keeps unused cached pipelines alive after their reference count reaches zero. This is intentional: applications often create and destroy the same pipeline shapes repeatedly, and retaining them allows later requests to hit the cache instead of recreating pipeline state.
 
 If an application creates very large numbers of distinct pipelines and cache growth becomes a memory concern, set `device.props._destroyPipelines` to `true`. In that mode, `PipelineFactory.release()` will evict cached pipelines once they become unused, trading memory usage for more frequent pipeline recreation work.
+
+For a bounded cache, set `device.props._pipelineCacheLimit` (or its alias
+`_pipelineCacheBudget`) to the maximum number of retained entries per render or compute cache.
+Unused entries are evicted least-recently-used first; active entries stay alive until released.
+`PipelineFactory.invalidate()` drops all cached and pending pipelines after device loss, WebGL
+context loss, or other backend-handle invalidation.
 
 ## Remarks
 

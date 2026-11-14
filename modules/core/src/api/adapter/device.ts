@@ -466,6 +466,13 @@ export type DeviceProps = {
   _destroyShaders?: boolean;
   /** Enable pipeline caching (via PipelineFactory) */
   _cachePipelines?: boolean;
+  /**
+   * Maximum number of retained render and compute pipeline entries per cache.
+   * Undefined or non-finite preserves the default unbounded cache. Zero evicts unused entries.
+   */
+  _pipelineCacheLimit?: number;
+  /** Alias for `_pipelineCacheLimit`, expressed as a cache-entry budget. */
+  _pipelineCacheBudget?: number;
   /** Enable sharing of backend render-pipeline implementations when caching is enabled. Currently used by WebGL. */
   _sharePipelines?: boolean;
   /**
@@ -474,6 +481,11 @@ export type DeviceProps = {
    * Enable this if the application creates very large numbers of distinct pipelines and needs cache eviction.
    */
   _destroyPipelines?: boolean;
+  /**
+   * Maximum number of sampler handles retained per device.
+   * Undefined preserves the default unbounded sampler cache.
+   */
+  _samplerCacheLimit?: number;
 
   /** @deprecated Internal, Do not use directly! Use `luma.attachDevice()` to attach to pre-created contexts/devices. */
   _handle?: unknown; // WebGL2RenderingContext | GPUDevice | null;
@@ -1041,6 +1053,51 @@ or create a device with the 'debug: true' prop.`;
   getModuleData<ModuleDataT extends Record<string, unknown>>(moduleName: string): ModuleDataT {
     this._moduleData[moduleName] ||= {};
     return this._moduleData[moduleName] as ModuleDataT;
+  }
+
+  /**
+   * Drops device-local caches whose entries reference backend handles.
+   *
+   * Backends call this before rebuilding resources after device loss or context restoration.
+   * Individual backend sampler caches are invalidated by the backend itself.
+   */
+  protected _invalidateResourceCaches(reason: string): void {
+    const moduleData = this.getModuleData<{
+      defaultPipelineFactory?: {invalidate?: (reason?: string) => void};
+      defaultShaderFactory?: {invalidate?: (reason?: string) => void};
+      pipelineFactories?: Set<WeakRef<{invalidate?: (reason?: string) => void}>>;
+      shaderFactories?: Set<WeakRef<{invalidate?: (reason?: string) => void}>>;
+    }>('@luma.gl/core');
+    const pipelineFactories = moduleData.pipelineFactories;
+    if (pipelineFactories?.size) {
+      for (const pipelineFactoryReference of pipelineFactories) {
+        const pipelineFactory = pipelineFactoryReference.deref();
+        if (pipelineFactory) {
+          pipelineFactory.invalidate?.(reason);
+        } else {
+          pipelineFactories.delete(pipelineFactoryReference);
+        }
+      }
+    } else {
+      moduleData.defaultPipelineFactory?.invalidate?.(reason);
+    }
+    const shaderFactories = moduleData.shaderFactories;
+    if (shaderFactories?.size) {
+      for (const shaderFactoryReference of shaderFactories) {
+        const shaderFactory = shaderFactoryReference.deref();
+        if (shaderFactory) {
+          shaderFactory.invalidate?.(reason);
+        } else {
+          shaderFactories.delete(shaderFactoryReference);
+        }
+      }
+    } else {
+      moduleData.defaultShaderFactory?.invalidate?.(reason);
+    }
+    const bindGroupFactory = this._factories.bindGroupFactory as
+      | {invalidate?: () => void}
+      | undefined;
+    bindGroupFactory?.invalidate?.();
   }
 
   // INTERNAL HELPERS

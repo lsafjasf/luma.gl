@@ -45,7 +45,12 @@ import {Buffer, Device, DeviceFeatures, isHTMLInCanvasSupported} from '../../ind
 import {WebGPUBuffer} from './resources/webgpu-buffer';
 import {WebGPUTexture} from './resources/webgpu-texture';
 import {WebGPUExternalTexture} from './resources/webgpu-external-texture';
-import {WebGPUSampler, type WebGPUSamplerProps} from './resources/webgpu-sampler';
+import {
+  WebGPUSampler,
+  createWebGPUSamplerHandle,
+  type WebGPUSamplerProps
+} from './resources/webgpu-sampler';
+import {SamplerCache} from '../../api/factories/sampler-cache';
 import {WebGPUShader} from './resources/webgpu-shader';
 import {WebGPURenderPipeline} from './resources/webgpu-render-pipeline';
 import {WebGPURenderBundleEncoder} from './resources/webgpu-render-bundle';
@@ -111,6 +116,8 @@ export class WebGPUDevice extends Device {
   private _isLost: boolean = false;
   private isDestroyed: boolean = false;
   private _defaultSampler: WebGPUSampler | null = null;
+  private _renderPassCacheGeneration: number = 0;
+  private readonly _samplerCache = new SamplerCache<GPUSampler>(this, () => {});
   private _onUncapturedError = (event: Event): void => {
     event.preventDefault();
     // TODO is this the right way to make sure the error is an Error instance?
@@ -160,6 +167,9 @@ export class WebGPUDevice extends Device {
     // "Context" loss handling
     this.lost = this.handle.lost.then(lostInfo => {
       this._isLost = true;
+      this._renderPassCacheGeneration++;
+      this._invalidateResourceCaches('device lost');
+      this._samplerCache.invalidate();
       // A lost GPUDevice cannot be attached again, so stop returning this wrapper for it
       if (devicesByHandle.get(device) === this) {
         devicesByHandle.delete(device);
@@ -195,6 +205,9 @@ export class WebGPUDevice extends Device {
     }
     this.isDestroyed = true;
     this._isLost = true;
+    this._renderPassCacheGeneration++;
+    this._invalidateResourceCaches('device destroyed');
+    this._samplerCache.invalidate();
     this.commandEncoder?.destroy();
     this._defaultSampler?.destroy();
     this._defaultSampler = null;
@@ -214,6 +227,11 @@ export class WebGPUDevice extends Device {
 
   get isLost(): boolean {
     return this._isLost;
+  }
+
+  /** @internal Generation used to reject stale cached render-pass descriptors. */
+  get _renderPassDescriptorGeneration(): number {
+    return this._renderPassCacheGeneration;
   }
 
   getShaderLayout(source: string, options?: ScanWGSLInterfaceOptions) {
@@ -243,7 +261,24 @@ export class WebGPUDevice extends Device {
   }
 
   createSampler(props: SamplerProps): WebGPUSampler {
-    return new WebGPUSampler(this, props as WebGPUSamplerProps);
+    const webgpuSamplerProps = props as WebGPUSamplerProps;
+    if (webgpuSamplerProps.handle || webgpuSamplerProps._isHandleBorrowed) {
+      return new WebGPUSampler(this, webgpuSamplerProps);
+    }
+    const {key, handle} = this._samplerCache.retain(webgpuSamplerProps, () =>
+      createWebGPUSamplerHandle(this, webgpuSamplerProps)
+    );
+    return new WebGPUSampler(this, {
+      ...webgpuSamplerProps,
+      handle,
+      _isHandleBorrowed: true,
+      _samplerCacheKey: key
+    });
+  }
+
+  /** @internal Releases one wrapper reference from the native sampler cache. */
+  _releaseCachedSampler(cacheKey: string | undefined): void {
+    this._samplerCache.release(cacheKey);
   }
 
   getDefaultSampler(): WebGPUSampler {

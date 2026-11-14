@@ -7,6 +7,13 @@ import {Framebuffer} from '../../../index';
 import {WebGPUDevice} from '../webgpu-device';
 import {WebGPUTextureView} from './webgpu-texture-view';
 
+/** Cached descriptor retained until an attachment handle or pass signature changes. */
+export type RenderPassDescriptorCacheEntry = {
+  generation: number;
+  handles: unknown[];
+  descriptor: GPURenderPassDescriptor;
+};
+
 /**
  * Create new textures with correct size for all attachments.
  * @note resize() destroys existing textures (if size has changed).
@@ -17,6 +24,8 @@ export class WebGPUFramebuffer extends Framebuffer {
 
   readonly colorAttachments: WebGPUTextureView[] = [];
   readonly depthStencilAttachment: WebGPUTextureView | null = null;
+  /** @internal Descriptor cache keyed by the immutable part of RenderPassProps. */
+  readonly _renderPassDescriptorCache = new Map<string, RenderPassDescriptorCacheEntry>();
 
   constructor(device: WebGPUDevice, props: FramebufferProps) {
     super(device, props);
@@ -49,5 +58,10 @@ export class WebGPUFramebuffer extends Framebuffer {
     this.props.height = this.height;
     this.props.colorAttachments = [colorAttachment.texture];
     this.props.depthStencilAttachment = depthStencilAttachment?.texture || null;
+    this._renderPassDescriptorCache.clear();
+  }
+
+  protected override destroyHandle(): void {
+    this._renderPassDescriptorCache.clear();
   }
 }

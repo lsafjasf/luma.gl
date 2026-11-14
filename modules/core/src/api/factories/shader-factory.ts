@@ -35,6 +35,19 @@ export class ShaderFactory {
   /** @internal */
   constructor(device: Device) {
     this.device = device;
+    const moduleData = device.getModuleData<CoreModuleState>('@luma.gl/core');
+    moduleData.shaderFactories ||= new Set();
+    moduleData.shaderFactories.add(new WeakRef(this));
+  }
+
+  /** Drops cached shader wrappers after device loss or context restoration. */
+  invalidate(_reason: string = 'cache invalidated'): void {
+    for (const cacheEntry of Object.values(this._cache)) {
+      cacheEntry.resource.destroy();
+    }
+    for (const key of Object.keys(this._cache)) {
+      delete this._cache[key];
+    }
   }
 
   /** Requests a {@link Shader} from the cache, creating a new Shader only if necessary. */
